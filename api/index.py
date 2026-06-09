@@ -1,238 +1,157 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
 from datetime import datetime
-
-# ─────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────
-MONGO_URI  = "mongodb+srv://Databaseapi:Databaseapi@cluster0.ymhnaiy.mongodb.net/?appName=Cluster0"
-DB_NAME    = "lottery_db"
-COLLECTION = "results"
+from collections import Counter
 
 app = Flask(__name__)
 CORS(app)
 
-# ── MongoDB (lazy singleton so cold-start is fast) ──
-_client = None
-def get_col():
-    global _client
-    if _client is None:
-        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    return _client[DB_NAME][COLLECTION]
+MONGO_URI = "mongodb+srv://Databaseapi:Databaseapi@cluster0.ymhnaiy.mongodb.net/?appName=Cluster0"
+client    = MongoClient(MONGO_URI)
+col       = client["lottery_db"]["results"]
 
+# ── Core Math ─────────────────────────────────────────────
 
-# ─────────────────────────────────────────
-#  MATH HELPERS
-# ─────────────────────────────────────────
-def digital_root(n: int) -> int:
-    n = abs(n)
+def digital_root(n):
+    n = abs(int(n))
     return 0 if n == 0 else 1 + (n - 1) % 9
 
-def classify(dr: int) -> dict:
-    if dr % 2 == 0:
-        return {"size": "BIG",   "color": "RED",   "parity": "Even"}
-    return     {"size": "SMALL", "color": "GREEN", "parity": "Odd"}
+def to_size(dr):
+    return "BIG" if dr % 2 == 0 else "SMALL"
 
-def last_digit(number) -> int:
-    return int(str(int(number))[-1])
+def last_digit(x):
+    return int(str(int(x))[-1])
 
+# ── 5 Analysis Methods on full data ───────────────────────
 
-# ─────────────────────────────────────────
-#  STRATEGY 1 – DRS  (Digital Root Subtraction)
-#  Formula : (N1 + N3) − N2  → digital_root
-# ─────────────────────────────────────────
-def strategy_drs(n1, n2, n3) -> dict:
-    raw = (n1 + n3) - n2
-    dr  = digital_root(raw)
-    return {
-        "strategy"    : "DRS",
-        "formula"     : f"({n1} + {n3}) - {n2} = {raw}",
-        "digital_root": dr,
-        **classify(dr),
+def method_drs(nums):
+    """Last 3 numbers: (N1+N3)-N2"""
+    n1, n2, n3 = nums[0], nums[1], nums[2]
+    return to_size(digital_root((n1 + n3) - n2))
+
+def method_wfd(nums):
+    """Last 3: (N1x3)-(N2x2)+N3"""
+    n1, n2, n3 = nums[0], nums[1], nums[2]
+    return to_size(digital_root((n1 * 3) - (n2 * 2) + n3))
+
+def method_trend(nums):
+    """Last 10 numbers: count BIG vs SMALL, predict minority (reversion)"""
+    sizes = [to_size(digital_root(n)) for n in nums[:50]]
+    big   = sizes.count("BIG")
+    small = sizes.count("SMALL")
+    # Reversion: if too many BIG recently, SMALL is due
+    return "SMALL" if big > small else "BIG"
+
+def method_streak(nums):
+    """If same result 3+ times in a row, predict opposite"""
+    sizes = [to_size(digital_root(n)) for n in nums[:6]]
+    if len(sizes) >= 3 and sizes[0] == sizes[1] == sizes[2]:
+        return "BIG" if sizes[0] == "SMALL" else "SMALL"
+    return to_size(digital_root(nums[0]))  # fallback: current trend
+
+def method_sum_pattern(nums):
+    """Last 5 numbers sum -> digital root -> size"""
+    s = sum(nums[:5])
+    return to_size(digital_root(s))
+
+# ── Deep Analysis: use ALL data ────────────────────────────
+
+def deep_predict(all_nums):
+    votes = [
+        method_drs(all_nums),
+        method_wfd(all_nums),
+        method_trend(all_nums),
+        method_streak(all_nums),
+        method_sum_pattern(all_nums),
+    ]
+    count   = Counter(votes)
+    winner  = count.most_common(1)[0][0]
+    score   = count[winner]
+    confidence = "HIGH" if score >= 4 else "MEDIUM" if score == 3 else "LOW"
+    return winner, confidence, {
+        "DRS"         : votes[0],
+        "WFD"         : votes[1],
+        "Trend"       : votes[2],
+        "Streak"      : votes[3],
+        "SumPattern"  : votes[4],
+        "votes_BIG"   : count.get("BIG", 0),
+        "votes_SMALL" : count.get("SMALL", 0),
     }
 
+# ── Win/Loss History ───────────────────────────────────────
 
-# ─────────────────────────────────────────
-#  STRATEGY 2 – WFD  (Weighted Fibonacci Difference)
-#  Formula : (N1×3) − (N2×2) + N3  → digital_root
-# ─────────────────────────────────────────
-def strategy_wfd(n1, n2, n3) -> dict:
-    raw = (n1 * 3) - (n2 * 2) + n3
-    dr  = digital_root(raw)
-    return {
-        "strategy"    : "WFD",
-        "formula"     : f"({n1}×3) - ({n2}×2) + {n3} = {raw}",
-        "digital_root": dr,
-        **classify(dr),
-    }
+def build_history(docs):
+    """
+    For each doc (latest first), predict using data BEFORE it,
+    compare with actual result → WIN or LOSS
+    """
+    history = []
+    for i in range(len(docs)):
+        doc  = docs[i]
+        past = docs[i+1:]  # older data only
+        if len(past) < 5:
+            continue
 
+        past_nums = [last_digit(d["number"]) for d in past]
+        pred, conf, breakdown = deep_predict(past_nums)
 
-# ─────────────────────────────────────────
-#  FINAL VOTE  (both strategies combined)
-# ─────────────────────────────────────────
-def final_vote(s1, s2) -> dict:
-    if s1["size"] == s2["size"]:
-        return {"prediction": s1["size"], "color": s1["color"], "confidence": "HIGH"}
-    return {"prediction": "MIXED", "color": "YELLOW", "confidence": "LOW"}
+        actual = doc.get("mapped", "")
+        if actual == "B":
+            actual_size = "BIG"
+        elif actual == "S":
+            actual_size = "SMALL"
+        else:
+            dr = digital_root(last_digit(doc["number"]))
+            actual_size = to_size(dr)
 
+        result = "WIN" if pred == actual_size else "LOSS"
 
-# ─────────────────────────────────────────
-#  ENRICH ONE DOCUMENT
-#  doc     = current period (N1)
-#  history = list of older docs, newest-first (N2 = [0], N3 = [1])
-# ─────────────────────────────────────────
-def enrich(doc, history) -> dict:
-    base = {k: v for k, v in doc.items() if k != "_id"}
+        history.append({
+            "issue_id"   : doc.get("issue_id"),
+            "number"     : doc.get("number"),
+            "actual"     : actual_size,
+            "predicted"  : pred,
+            "confidence" : conf,
+            "result"     : result,
+            "breakdown"  : breakdown,
+        })
 
-    if len(history) < 2 or doc.get("number") is None:
-        return {**base, "analysis": None, "prediction": None, "outcome": None}
+    return history
 
-    n1 = last_digit(doc["number"])
-    n2 = last_digit(history[0]["number"])
-    n3 = last_digit(history[1]["number"])
+# ── Route ─────────────────────────────────────────────────
 
-    s1   = strategy_drs(n1, n2, n3)
-    s2   = strategy_wfd(n1, n2, n3)
-    vote = final_vote(s1, s2)
-
-    actual_dr  = digital_root(n1)
-    actual     = classify(actual_dr)
-
-    outcome = {
-        "actual_size" : actual["size"],
-        "actual_color": actual["color"],
-        "actual_dr"   : actual_dr,
-        "drs_result"  : "WIN" if s1["size"] == actual["size"] else "LOSS",
-        "wfd_result"  : "WIN" if s2["size"] == actual["size"] else "LOSS",
-        "combined"    : "WIN" if vote["prediction"] == actual["size"] else "LOSS",
-    }
-
-    return {**base, "n1": n1, "n2": n2, "n3": n3,
-            "analysis": {"DRS": s1, "WFD": s2},
-            "prediction": vote, "outcome": outcome}
-
-
-# ─────────────────────────────────────────
-#  ROUTES
-# ─────────────────────────────────────────
-
-# ── Health check ──────────────────────────
-@app.route("/api/health")
-def health():
-    try:
-        get_col().database.client.admin.command("ping")
-        return jsonify({"status": "ok", "db": "connected",
-                        "time": datetime.utcnow().isoformat() + "Z"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-# ── Last N results with full analysis ─────
-@app.route("/api/results")
-def results():
-    limit = min(int(request.args.get("limit", 50)), 200)
-    raw   = list(get_col().find({}, {"_id": 0}).sort("period", -1).limit(limit))
-
-    if not raw:
-        return jsonify({"status": "ok", "count": 0, "data": [], "summary": {}})
-
-    enriched = [enrich(raw[i], raw[i+1:]) for i in range(len(raw))]
-
-    # Summary stats
-    valid      = [d for d in enriched if d["outcome"]]
-    total      = len(valid)
-    wins_drs   = sum(1 for d in valid if d["outcome"]["drs_result"] == "WIN")
-    wins_wfd   = sum(1 for d in valid if d["outcome"]["wfd_result"] == "WIN")
-    wins_comb  = sum(1 for d in valid if d["outcome"]["combined"]   == "WIN")
-
-    summary = {
-        "total_analyzed"   : total,
-        "DRS_wins"         : wins_drs,
-        "WFD_wins"         : wins_wfd,
-        "Combined_wins"    : wins_comb,
-        "DRS_accuracy_pct" : round(wins_drs  / total * 100, 1) if total else 0,
-        "WFD_accuracy_pct" : round(wins_wfd  / total * 100, 1) if total else 0,
-        "Combined_accuracy": round(wins_comb / total * 100, 1) if total else 0,
-    }
-
-    return jsonify({"status": "ok", "count": len(enriched),
-                    "data": enriched, "summary": summary})
-
-
-# ── Next period prediction ─────────────────
+@app.route("/")
 @app.route("/api/predict")
-def predict():
-    raw = list(get_col().find({}, {"_id": 0}).sort("period", -1).limit(3))
+def get_prediction():
+    # Fetch ALL available data, sorted latest first
+    docs = list(col.find({}, {"_id": 0}).sort("issue_id", -1))
 
-    if len(raw) < 3:
-        return jsonify({"status": "error",
-                        "message": "Need at least 3 results in DB"}), 400
+    if len(docs) < 5:
+        return jsonify({"error": "Not enough data"}), 400
 
-    n1 = last_digit(raw[0]["number"])
-    n2 = last_digit(raw[1]["number"])
-    n3 = last_digit(raw[2]["number"])
+    all_nums = [last_digit(d["number"]) for d in docs]
 
-    s1   = strategy_drs(n1, n2, n3)
-    s2   = strategy_wfd(n1, n2, n3)
-    vote = final_vote(s1, s2)
+    # Next prediction using full data
+    prediction, confidence, breakdown = deep_predict(all_nums)
 
-    return jsonify({
-        "status"          : "ok",
-        "based_on"        : {"N1_latest": n1, "N2_prev": n2, "N3_third": n3,
-                             "periods"  : [r.get("period") for r in raw]},
-        "DRS"             : s1,
-        "WFD"             : s2,
-        "final_prediction": vote,
-        "generated_at"    : datetime.utcnow().isoformat() + "Z",
-    })
+    # History: last 20 predictions vs actual
+    history = build_history(docs[:22])  # use latest 22 to get 20 history rows
 
-
-# ── Deep stats (accuracy, streaks) ────────
-@app.route("/api/stats")
-def stats():
-    raw = list(get_col().find({}, {"_id": 0}).sort("period", -1).limit(200))
-
-    if len(raw) < 3:
-        return jsonify({"status": "error", "message": "Need at least 3 results"}), 400
-
-    wins_drs = wins_wfd = wins_comb = total = 0
-    best_drs = best_wfd = cur_drs = cur_wfd = 0
-    recent   = []  # last 10 combined outcomes
-
-    for i in range(len(raw)):
-        hist = raw[i+1:]
-        if len(hist) < 2:
-            continue
-        d = enrich(raw[i], hist)
-        if not d["outcome"]:
-            continue
-        total += 1
-        o = d["outcome"]
-
-        if o["drs_result"] == "WIN": wins_drs += 1; cur_drs += 1
-        else: cur_drs = 0
-        if o["wfd_result"] == "WIN": wins_wfd += 1; cur_wfd += 1
-        else: cur_wfd = 0
-        if o["combined"]   == "WIN": wins_comb += 1
-
-        best_drs = max(best_drs, cur_drs)
-        best_wfd = max(best_wfd, cur_wfd)
-
-        if len(recent) < 10:
-            recent.append({"period": raw[i].get("period"), "result": o["combined"]})
+    wins   = sum(1 for h in history if h["result"] == "WIN")
+    losses = sum(1 for h in history if h["result"] == "LOSS")
+    total  = wins + losses
+    accuracy = round(wins / total * 100, 1) if total else 0
 
     return jsonify({
-        "status"        : "ok",
-        "total_analyzed": total,
-        "DRS"           : {"wins": wins_drs, "accuracy_pct": round(wins_drs/total*100,1) if total else 0, "best_streak": best_drs},
-        "WFD"           : {"wins": wins_wfd, "accuracy_pct": round(wins_wfd/total*100,1) if total else 0, "best_streak": best_wfd},
-        "Combined"      : {"wins": wins_comb,"accuracy_pct": round(wins_comb/total*100,1) if total else 0},
-        "recent_10"     : recent,
+        "latest_issue_id" : docs[0].get("issue_id"),
+        "total_records"   : len(docs),
+        "next_prediction" : prediction,
+        "confidence"      : confidence,
+        "breakdown"       : breakdown,
+        "accuracy_last20" : f"{accuracy}%",
+        "wins_last20"     : wins,
+        "losses_last20"   : losses,
+        "history"         : history,
+        "generated_at"    : datetime.utcnow().isoformat() + "Z"
     })
-
-
-# ─────────────────────────────────────────
-#  Vercel entry-point  (must be named `app`)
-# ─────────────────────────────────────────
-# Vercel calls this file as a WSGI app — `app` is auto-detected.
