@@ -11,8 +11,6 @@ MONGO_URI = "mongodb+srv://Databaseapi:Databaseapi@cluster0.ymhnaiy.mongodb.net/
 client    = MongoClient(MONGO_URI)
 col       = client["lottery_db"]["results"]
 
-# ── Core Math ─────────────────────────────────────────────
-
 def digital_root(n):
     n = abs(int(n))
     return 0 if n == 0 else 1 + (n - 1) % 9
@@ -23,135 +21,101 @@ def to_size(dr):
 def last_digit(x):
     return int(str(int(x))[-1])
 
-# ── 5 Analysis Methods on full data ───────────────────────
-
-def method_drs(nums):
-    """Last 3 numbers: (N1+N3)-N2"""
+def deep_predict(nums):
     n1, n2, n3 = nums[0], nums[1], nums[2]
-    return to_size(digital_root((n1 + n3) - n2))
 
-def method_wfd(nums):
-    """Last 3: (N1x3)-(N2x2)+N3"""
-    n1, n2, n3 = nums[0], nums[1], nums[2]
-    return to_size(digital_root((n1 * 3) - (n2 * 2) + n3))
+    # DRS
+    drs = to_size(digital_root((n1 + n3) - n2))
+    # WFD
+    wfd = to_size(digital_root((n1 * 3) - (n2 * 2) + n3))
+    # Trend last 50
+    sizes50 = [to_size(digital_root(n)) for n in nums[:50]]
+    big50   = sizes50.count("BIG")
+    sml50   = sizes50.count("SMALL")
+    trend   = "SMALL" if big50 > sml50 else "BIG"
+    # Streak
+    sizes6 = [to_size(digital_root(n)) for n in nums[:6]]
+    if len(sizes6) >= 3 and sizes6[0] == sizes6[1] == sizes6[2]:
+        streak = "BIG" if sizes6[0] == "SMALL" else "SMALL"
+    else:
+        streak = to_size(digital_root(n1))
+    # Sum pattern last 5
+    sump = to_size(digital_root(sum(nums[:5])))
 
-def method_trend(nums):
-    """Last 10 numbers: count BIG vs SMALL, predict minority (reversion)"""
-    sizes = [to_size(digital_root(n)) for n in nums[:50]]
-    big   = sizes.count("BIG")
-    small = sizes.count("SMALL")
-    # Reversion: if too many BIG recently, SMALL is due
-    return "SMALL" if big > small else "BIG"
-
-def method_streak(nums):
-    """If same result 3+ times in a row, predict opposite"""
-    sizes = [to_size(digital_root(n)) for n in nums[:6]]
-    if len(sizes) >= 3 and sizes[0] == sizes[1] == sizes[2]:
-        return "BIG" if sizes[0] == "SMALL" else "SMALL"
-    return to_size(digital_root(nums[0]))  # fallback: current trend
-
-def method_sum_pattern(nums):
-    """Last 5 numbers sum -> digital root -> size"""
-    s = sum(nums[:5])
-    return to_size(digital_root(s))
-
-# ── Deep Analysis: use ALL data ────────────────────────────
-
-def deep_predict(all_nums):
-    votes = [
-        method_drs(all_nums),
-        method_wfd(all_nums),
-        method_trend(all_nums),
-        method_streak(all_nums),
-        method_sum_pattern(all_nums),
-    ]
+    votes   = [drs, wfd, trend, streak, sump]
     count   = Counter(votes)
     winner  = count.most_common(1)[0][0]
     score   = count[winner]
-    confidence = "HIGH" if score >= 4 else "MEDIUM" if score == 3 else "LOW"
-    return winner, confidence, {
-        "DRS"         : votes[0],
-        "WFD"         : votes[1],
-        "Trend"       : votes[2],
-        "Streak"      : votes[3],
-        "SumPattern"  : votes[4],
-        "votes_BIG"   : count.get("BIG", 0),
-        "votes_SMALL" : count.get("SMALL", 0),
+    conf    = "HIGH" if score >= 4 else "MEDIUM" if score == 3 else "LOW"
+
+    return winner, conf, {
+        "DRS": drs, "WFD": wfd, "Trend50": trend,
+        "Streak": streak, "SumPattern": sump,
+        "votes_BIG": count.get("BIG", 0),
+        "votes_SMALL": count.get("SMALL", 0),
     }
 
-# ── Win/Loss History ───────────────────────────────────────
-
-def build_history(docs):
-    """
-    For each doc (latest first), predict using data BEFORE it,
-    compare with actual result → WIN or LOSS
-    """
-    history = []
-    for i in range(len(docs)):
-        doc  = docs[i]
-        past = docs[i+1:]  # older data only
-        if len(past) < 5:
-            continue
-
-        past_nums = [last_digit(d["number"]) for d in past]
-        pred, conf, breakdown = deep_predict(past_nums)
-
-        actual = doc.get("mapped", "")
-        if actual == "B":
-            actual_size = "BIG"
-        elif actual == "S":
-            actual_size = "SMALL"
-        else:
-            dr = digital_root(last_digit(doc["number"]))
-            actual_size = to_size(dr)
-
-        result = "WIN" if pred == actual_size else "LOSS"
-
-        history.append({
-            "issue_id"   : doc.get("issue_id"),
-            "number"     : doc.get("number"),
-            "actual"     : actual_size,
-            "predicted"  : pred,
-            "confidence" : conf,
-            "result"     : result,
-            "breakdown"  : breakdown,
-        })
-
-    return history
-
-# ── Route ─────────────────────────────────────────────────
+def get_actual(doc):
+    m = doc.get("mapped", "")
+    if m == "B": return "BIG"
+    if m == "S": return "SMALL"
+    return to_size(digital_root(last_digit(doc["number"])))
 
 @app.route("/")
 @app.route("/api/predict")
 def get_prediction():
-    # Fetch ALL available data, sorted latest first
     docs = list(col.find({}, {"_id": 0}).sort("issue_id", -1))
-
     if len(docs) < 5:
         return jsonify({"error": "Not enough data"}), 400
 
-    all_nums = [last_digit(d["number"]) for d in docs]
+    # ── CURRENT LIVE PERIOD ──
+    # Latest doc = just came in, result already saved
+    # So current running period = next one after latest
+    latest      = docs[0]
+    latest_id   = latest.get("issue_id", "")
+    # Next period number = latest + 1 (your system increments by 1)
+    try:
+        next_period = str(int(latest_id) + 1)
+    except:
+        next_period = "unknown"
 
-    # Next prediction using full data
+    # Predict for next period using all current data
+    all_nums = [last_digit(d["number"]) for d in docs]
     prediction, confidence, breakdown = deep_predict(all_nums)
 
-    # History: last 20 predictions vs actual
-    history = build_history(docs[:22])  # use latest 22 to get 20 history rows
+    # ── HISTORY: each past period — what was predicted BEFORE it, was it WIN/LOSS ──
+    history = []
+    for i in range(len(docs) - 5):
+        doc       = docs[i]          # this period's actual result
+        past_docs = docs[i+1:]       # data available BEFORE this period
+        past_nums = [last_digit(d["number"]) for d in past_docs]
+        pred, conf, bkd = deep_predict(past_nums)
+        actual  = get_actual(doc)
+        result  = "WIN" if pred == actual else "LOSS"
+        history.append({
+            "period"    : doc.get("issue_id"),
+            "number"    : doc.get("number"),
+            "predicted" : pred,
+            "actual"    : actual,
+            "result"    : result,
+            "confidence": conf,
+        })
+        if len(history) == 20:
+            break
 
-    wins   = sum(1 for h in history if h["result"] == "WIN")
-    losses = sum(1 for h in history if h["result"] == "LOSS")
-    total  = wins + losses
-    accuracy = round(wins / total * 100, 1) if total else 0
+    wins     = sum(1 for h in history if h["result"] == "WIN")
+    losses   = len(history) - wins
+    accuracy = round(wins / len(history) * 100, 1) if history else 0
 
     return jsonify({
-        "latest_issue_id" : docs[0].get("issue_id"),
-        "total_records"   : len(docs),
-        "next_prediction" : prediction,
+        "current_period"  : next_period,
+        "prediction"      : prediction,
         "confidence"      : confidence,
         "breakdown"       : breakdown,
-        "accuracy_last20" : f"{accuracy}%",
-        "wins_last20"     : wins,
-        "losses_last20"   : losses,
         "history"         : history,
-        "generated_at"    : datetime.utcnow().isoformat() + "Z"
+        "accuracy_last20" : f"{accuracy}%",
+        "wins"            : wins,
+        "losses"          : losses,
+        "total_records"   : len(docs),
+        "generated_at"    : datetime.utcnow().isoformat() + "Z",
     })
